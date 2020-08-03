@@ -17,23 +17,55 @@
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
 import collections
+from typing import NamedTuple, Optional, Union
+from tf_agents.typing import types
 
 
-# Returned with every call to policy.action() and policy.distribution().
-#
-# Attributes:
-#   action: An action tensor or action distribution for `TFPolicy`, or numpy
-#     array for `PyPolicy`.
-#   state: State of the policy to be fed back into the next call to
-#     policy.action() or policy.distribution(), e.g. an RNN state. For stateless
-#     policies, this will be an empty tuple.
-#   info: Auxiliary information emitted by the policy, e.g. log probabilities of
-#     the actions. For policies without info this will be an empty tuple.
-PolicyStep = collections.namedtuple('PolicyStep',
-                                    ('action', 'state', 'info'))
+ActionType = Union[types.NestedSpecTensorOrArray, types.NestedDistribution]
+
+
+class PolicyStep(
+    NamedTuple(
+        'PolicyStep',
+        [('action', ActionType),
+         ('state', types.NestedSpecTensorOrArray),
+         ('info', types.NestedSpecTensorOrArray)
+        ])):
+  """Returned with every call to `policy.action()` and `policy.distribution()`.
+
+  Attributes:
+   action: An action tensor or action distribution for `TFPolicy`, or numpy
+     array for `PyPolicy`.
+   state: State of the policy to be fed back into the next call to
+     policy.action() or policy.distribution(), e.g. an RNN state. For stateless
+     policies, this will be an empty tuple.
+   info: Auxiliary information emitted by the policy, e.g. log probabilities of
+     the actions. For policies without info this will be an empty tuple.
+  """
+  __slots__ = ()
+
+  def replace(self, **kwargs) -> 'PolicyStep':
+    """Exposes as namedtuple._replace.
+
+    Usage:
+    ```
+      new_policy_step = policy_step.replace(action=())
+    ```
+
+    This returns a new policy step with an empty action.
+
+    Args:
+      **kwargs: key/value pairs of fields in the policy step.
+
+    Returns:
+      A new `PolicyStep`.
+    """
+    return self._replace(**kwargs)
+
 
 # Set default empty tuple for PolicyStep.state and PolicyStep.info.
 PolicyStep.__new__.__defaults__ = ((),) * len(PolicyStep._fields)
@@ -54,7 +86,9 @@ PolicyInfo = collections.namedtuple('PolicyInfo',
                                     (CommonFields.LOG_PROBABILITY,))
 
 
-def set_log_probability(info, log_probability):
+def set_log_probability(
+    info: types.NestedTensorOrArray,
+    log_probability: types.Float) -> types.NestedTensorOrArray:
   """Sets the CommonFields.LOG_PROBABILITY on info to be log_probability."""
   if info in ((), None):
     return PolicyInfo(log_probability=log_probability)
@@ -68,7 +102,9 @@ def set_log_probability(info, log_probability):
   return info
 
 
-def get_log_probability(info, default_log_probability=None):
+def get_log_probability(
+    info: types.NestedTensorOrArray,
+    default_log_probability: Optional[types.Float] = None) -> types.Float:
   """Gets the CommonFields.LOG_PROBABILITY from info depending on type."""
   if isinstance(info, PolicyInfo):
     return getattr(info, CommonFields.LOG_PROBABILITY, default_log_probability)

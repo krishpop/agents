@@ -20,11 +20,12 @@ from __future__ import division
 from __future__ import print_function
 
 from absl.testing import parameterized
-import tensorflow as tf
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.agents.dqn import dqn_agent
 from tf_agents.networks import network
 from tf_agents.networks import q_network
+from tf_agents.networks import sequential
 from tf_agents.networks import test_utils as networks_test_utils
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import policy_step
@@ -45,19 +46,24 @@ class DummyNet(network.Network):
     super(DummyNet, self).__init__(
         observation_spec, state_spec=(), name=name)
     num_actions = action_spec.maximum - action_spec.minimum + 1
-    self._layers.append(
+
+    # Store custom layers that can be serialized through the Checkpointable API.
+    self._dummy_layers = [
         tf.keras.layers.Dense(
             num_actions,
             kernel_regularizer=tf.keras.regularizers.l2(
                 l2_regularization_weight),
-            kernel_initializer=tf.compat.v1.initializers.constant([[2, 1],
-                                                                   [1, 1]]),
-            bias_initializer=tf.compat.v1.initializers.constant([[1], [1]])))
+            kernel_initializer=tf.compat.v1.initializers.constant(
+                [[num_actions, 1],
+                 [1, 1]]),
+            bias_initializer=tf.compat.v1.initializers.constant(
+                [[1], [1]]))
+    ]
 
   def call(self, inputs, step_type=None, network_state=()):
     del step_type
     inputs = tf.cast(inputs, tf.float32)
-    for layer in self.layers:
+    for layer in self._dummy_layers:
       inputs = layer(inputs)
     return inputs, network_state
 
@@ -95,7 +101,7 @@ class DqnAgentTest(test_utils.TestCase):
     self.assertIsNotNone(agent.policy)
 
   def testCreateAgentWithPrebuiltPreprocessingLayers(self, agent_class):
-    dense_layer = tf.keras.layers.Dense(3)
+    dense_layer = tf.keras.layers.Dense(2)
     q_net = networks_test_utils.KerasLayersNet(self._observation_spec,
                                                self._action_spec,
                                                dense_layer)
@@ -107,16 +113,19 @@ class DqnAgentTest(test_utils.TestCase):
           q_network=q_net,
           optimizer=None)
 
-    # Explicitly share weights between q and target networks; this is ok.
+    # Explicitly share weights between q and target networks.
+    # This would be an unusual setup so we check that an error is thrown.
     q_target_net = networks_test_utils.KerasLayersNet(self._observation_spec,
                                                       self._action_spec,
                                                       dense_layer)
-    agent_class(
-        self._time_step_spec,
-        self._action_spec,
-        q_network=q_net,
-        optimizer=None,
-        target_q_network=q_target_net)
+    with self.assertRaisesRegexp(
+        ValueError, 'shares weights with the original network'):
+      agent_class(
+          self._time_step_spec,
+          self._action_spec,
+          q_network=q_net,
+          optimizer=None,
+          target_q_network=q_target_net)
 
   def testInitializeAgent(self, agent_class):
     q_net = DummyNet(self._observation_spec, self._action_spec)
@@ -134,9 +143,19 @@ class DqnAgentTest(test_utils.TestCase):
   def testCreateAgentDimChecks(self, agent_class):
     action_spec = tensor_spec.BoundedTensorSpec([1, 2], tf.int32, 0, 1)
     q_net = DummyNet(self._observation_spec, action_spec)
-    with self.assertRaisesRegexp(ValueError, '.*one dimensional.*'):
+    with self.assertRaisesRegex(ValueError, 'Only scalar actions'):
       agent_class(
           self._time_step_spec, action_spec, q_network=q_net, optimizer=None)
+
+  def testInvalidNetworkOutputSize(self, agent_class):
+    wrong_action_spec = tensor_spec.BoundedTensorSpec((), tf.int32, 0, 2)
+    q_net = q_network.QNetwork(
+        self._time_step_spec.observation,
+        wrong_action_spec)
+    with self.assertRaisesRegex(ValueError, r'with inner dims \(2,\)'):
+      agent_class(
+          self._time_step_spec, self._action_spec,
+          q_network=q_net, optimizer=None)
 
   # TODO(b/127383724): Add a test where the target network has different values.
   def testLoss(self, agent_class):
@@ -307,6 +326,54 @@ class DqnAgentTest(test_utils.TestCase):
     loss, _ = agent._loss(experience)
 
     self.evaluate(tf.compat.v1.global_variables_initializer())
+    self.assertAllClose(self.evaluate(loss), expected_loss)
+
+  def testLossRNNSmokeTest(self, agent_class):
+    q_net = sequential.Sequential([
+        tf.keras.layers.LSTM(
+            2, return_state=True, return_sequences=True,
+            kernel_initializer=tf.constant_initializer(0.5),
+            recurrent_initializer=tf.constant_initializer(0.5)),
+    ])
+    agent = agent_class(
+        self._time_step_spec,
+        self._action_spec,
+        q_network=q_net,
+        gamma=0.95,
+        optimizer=None)
+
+    observations = tf.constant([[1, 2], [3, 4]], dtype=tf.float32)
+    time_steps = ts.restart(observations, batch_size=2)
+
+    rewards = tf.constant([10, 20], dtype=tf.float32)
+    discounts = tf.constant([0.7, 0.8], dtype=tf.float32)
+
+    next_observations = tf.constant([[5, 6], [7, 8]], dtype=tf.float32)
+    next_time_steps = ts.transition(next_observations, rewards, discounts)
+    third_observations = tf.constant([[9, 10], [11, 12]], dtype=tf.float32)
+    third_time_steps = ts.transition(third_observations, rewards, discounts)
+
+    actions = tf.constant([0, 1], dtype=tf.int32)
+    action_steps = policy_step.PolicyStep(actions)
+
+    experience1 = trajectory.from_transition(
+        time_steps, action_steps, next_time_steps)
+    experience2 = trajectory.from_transition(
+        next_time_steps, action_steps, third_time_steps)
+    experience3 = trajectory.from_transition(
+        third_time_steps, action_steps, third_time_steps)
+
+    experience = tf.nest.map_structure(
+        lambda x, y, z: tf.stack([x, y, z], axis=1),
+        experience1, experience2, experience3)
+
+    loss, _ = agent._loss(experience)
+
+    self.evaluate(tf.compat.v1.global_variables_initializer())
+
+    # Smoke test, here to make sure the calculation does not change as we
+    # modify preprocessing or other internals.
+    expected_loss = 28.722265
     self.assertAllClose(self.evaluate(loss), expected_loss)
 
   def testLossNStepMidMidLastFirst(self, agent_class):

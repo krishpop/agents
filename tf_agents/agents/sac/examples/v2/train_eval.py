@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python2, python3
 r"""Train and Eval SAC.
+
+All hyperparameters come from the SAC paper
+https://arxiv.org/pdf/1812.05905.pdf
 
 To run:
 
@@ -38,17 +42,18 @@ from absl import flags
 from absl import logging
 
 import gin
-import tensorflow as tf
+from six.moves import range
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.agents.ddpg import critic_network
 from tf_agents.agents.sac import sac_agent
+from tf_agents.agents.sac import tanh_normal_projection_network
 from tf_agents.drivers import dynamic_step_driver
 from tf_agents.environments import suite_mujoco
 from tf_agents.environments import tf_py_environment
 from tf_agents.eval import metric_utils
 from tf_agents.metrics import tf_metrics
 from tf_agents.networks import actor_distribution_network
-from tf_agents.networks import normal_projection_network
 from tf_agents.policies import greedy_policy
 from tf_agents.policies import random_tf_policy
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
@@ -64,31 +69,25 @@ FLAGS = flags.FLAGS
 
 
 @gin.configurable
-def normal_projection_net(action_spec,
-                          init_action_stddev=0.35,
-                          init_means_output_factor=0.1):
-  del init_action_stddev
-  return normal_projection_network.NormalProjectionNetwork(
-      action_spec,
-      mean_transform=None,
-      state_dependent_std=True,
-      init_means_output_factor=init_means_output_factor,
-      std_transform=sac_agent.std_clip_transform,
-      scale_distribution=True)
-
-
-@gin.configurable
 def train_eval(
     root_dir,
     env_name='HalfCheetah-v2',
     eval_env_name=None,
     env_load_fn=suite_mujoco.load,
-    num_iterations=1000000,
+    # The SAC paper reported:
+    # Hopper and Cartpole results up to 1000000 iters,
+    # Humanoid results up to 10000000 iters,
+    # Other mujoco tasks up to 3000000 iters.
+    num_iterations=3000000,
     actor_fc_layers=(256, 256),
     critic_obs_fc_layers=None,
     critic_action_fc_layers=None,
     critic_joint_fc_layers=(256, 256),
     # Params for collect
+    # Follow https://github.com/haarnoja/sac/blob/master/examples/variants.py
+    # HalfCheetah and Ant take 10000 initial collection steps.
+    # Other mujoco tasks take 1000.
+    # Different choices roughly keep the initial episodes about the same.
     initial_collect_steps=10000,
     collect_steps_per_iteration=1,
     replay_buffer_capacity=1000000,
@@ -101,17 +100,17 @@ def train_eval(
     actor_learning_rate=3e-4,
     critic_learning_rate=3e-4,
     alpha_learning_rate=3e-4,
-    td_errors_loss_fn=tf.compat.v1.losses.mean_squared_error,
+    td_errors_loss_fn=tf.math.squared_difference,
     gamma=0.99,
-    reward_scale_factor=1.0,
+    reward_scale_factor=0.1,
     gradient_clipping=None,
     use_tf_functions=True,
     # Params for eval
     num_eval_episodes=30,
     eval_interval=10000,
     # Params for summaries and logging
-    train_checkpoint_interval=10000,
-    policy_checkpoint_interval=5000,
+    train_checkpoint_interval=50000,
+    policy_checkpoint_interval=50000,
     rb_checkpoint_interval=50000,
     log_interval=1000,
     summary_interval=1000,
@@ -150,12 +149,15 @@ def train_eval(
         observation_spec,
         action_spec,
         fc_layer_params=actor_fc_layers,
-        continuous_projection_net=normal_projection_net)
+        continuous_projection_net=tanh_normal_projection_network
+        .TanhNormalProjectionNetwork)
     critic_net = critic_network.CriticNetwork(
         (observation_spec, action_spec),
         observation_fc_layer_params=critic_obs_fc_layers,
         action_fc_layer_params=critic_action_fc_layers,
-        joint_fc_layer_params=critic_joint_fc_layers)
+        joint_fc_layer_params=critic_joint_fc_layers,
+        kernel_initializer='glorot_uniform',
+        last_kernel_initializer='glorot_uniform')
 
     tf_agent = sac_agent.SacAgent(
         time_step_spec,
@@ -220,7 +222,7 @@ def train_eval(
     initial_collect_driver = dynamic_step_driver.DynamicStepDriver(
         tf_env,
         initial_collect_policy,
-        observers=replay_observer,
+        observers=replay_observer + train_metrics,
         num_steps=initial_collect_steps)
 
     collect_driver = dynamic_step_driver.DynamicStepDriver(
@@ -234,11 +236,12 @@ def train_eval(
       collect_driver.run = common.function(collect_driver.run)
       tf_agent.train = common.function(tf_agent.train)
 
-    # Collect initial replay data.
-    logging.info(
-        'Initializing replay buffer by collecting experience for %d steps with '
-        'a random policy.', initial_collect_steps)
-    initial_collect_driver.run()
+    if replay_buffer.num_frames() == 0:
+      # Collect initial replay data.
+      logging.info(
+          'Initializing replay buffer by collecting experience for %d steps '
+          'with a random policy.', initial_collect_steps)
+      initial_collect_driver.run()
 
     results = metric_utils.eager_compute(
         eval_metrics,
@@ -259,11 +262,14 @@ def train_eval(
     timed_at_step = global_step.numpy()
     time_acc = 0
 
-    # Dataset generates trajectories with shape [Bx2x...]
+    # Prepare replay buffer as dataset with invalid transitions filtered.
+    def _filter_invalid_transition(trajectories, unused_arg1):
+      return ~trajectories.is_boundary()[0]
     dataset = replay_buffer.as_dataset(
-        num_parallel_calls=3,
         sample_batch_size=batch_size,
-        num_steps=2).prefetch(3)
+        num_steps=2).unbatch().filter(
+            _filter_invalid_transition).batch(batch_size).prefetch(5)
+    # Dataset generates trajectories with shape [Bx2x...]
     iterator = iter(dataset)
 
     def train_step():
@@ -273,7 +279,8 @@ def train_eval(
     if use_tf_functions:
       train_step = common.function(train_step)
 
-    for _ in range(num_iterations):
+    global_step_val = global_step.numpy()
+    while global_step_val < num_iterations:
       start_time = time.time()
       time_step, policy_state = collect_driver.run(
           time_step=time_step,
@@ -283,21 +290,23 @@ def train_eval(
         train_loss = train_step()
       time_acc += time.time() - start_time
 
-      if global_step.numpy() % log_interval == 0:
-        logging.info('step = %d, loss = %f', global_step.numpy(),
+      global_step_val = global_step.numpy()
+
+      if global_step_val % log_interval == 0:
+        logging.info('step = %d, loss = %f', global_step_val,
                      train_loss.loss)
-        steps_per_sec = (global_step.numpy() - timed_at_step) / time_acc
+        steps_per_sec = (global_step_val - timed_at_step) / time_acc
         logging.info('%.3f steps/sec', steps_per_sec)
         tf.compat.v2.summary.scalar(
             name='global_steps_per_sec', data=steps_per_sec, step=global_step)
-        timed_at_step = global_step.numpy()
+        timed_at_step = global_step_val
         time_acc = 0
 
       for train_metric in train_metrics:
         train_metric.tf_summaries(
             train_step=global_step, step_metrics=train_metrics[:2])
 
-      if global_step.numpy() % eval_interval == 0:
+      if global_step_val % eval_interval == 0:
         results = metric_utils.eager_compute(
             eval_metrics,
             eval_tf_env,
@@ -308,10 +317,9 @@ def train_eval(
             summary_prefix='Metrics',
         )
         if eval_metrics_callback is not None:
-          eval_metrics_callback(results, global_step.numpy())
+          eval_metrics_callback(results, global_step_val)
         metric_utils.log_metrics(eval_metrics)
 
-      global_step_val = global_step.numpy()
       if global_step_val % train_checkpoint_interval == 0:
         train_checkpointer.save(global_step=global_step_val)
 

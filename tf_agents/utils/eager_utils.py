@@ -56,7 +56,7 @@ from absl import logging
 
 import numpy as np
 import six
-import tensorflow as tf
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.utils import common
 
@@ -346,7 +346,7 @@ def create_train_step(loss,
     variables_to_train = variables_to_train()
   variables_to_train = tf.nest.flatten(variables_to_train)
   grads = tape.gradient(total_loss_value, variables_to_train)
-  grads_and_vars = zip(grads, variables_to_train)
+  grads_and_vars = list(zip(grads, variables_to_train))
 
   if transform_grads_fn:
     grads_and_vars = transform_grads_fn(grads_and_vars)

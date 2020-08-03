@@ -20,16 +20,18 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
-import tensorflow as tf
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 import tensorflow_probability as tfp
-
 from tf_agents.specs import array_spec
-from tensorflow.python.framework import ops  # TF internal
+
+from google.protobuf import text_format
+from tensorflow.core.protobuf import struct_pb2  # pylint:disable=g-direct-tensorflow-import  # TF internal
 from tensorflow.python.framework import tensor_spec as ts  # TF internal
+from tensorflow.python.saved_model import nested_structure_coder  # pylint:disable=g-direct-tensorflow-import  # TF internal
 
 tfd = tfp.distributions
 
-TensorSpec = ts.TensorSpec
+TensorSpec = tf.TensorSpec
 BoundedTensorSpec = ts.BoundedTensorSpec
 
 
@@ -182,7 +184,7 @@ def _random_uniform_int(shape, outer_dims, minval, maxval, dtype, seed=None):
   #  stack on innermost axis to get [5, 3, 2]
   #  reshape to get [5, 3, 2]
   samples = []
-  shape = ops.convert_to_tensor(shape, dtype=tf.int32)
+  shape = tf.convert_to_tensor(shape, dtype=tf.int32)
   sample_shape = tf.concat((outer_dims, shape[:-len(minval.shape)]), axis=0)
   full_shape = tf.concat((outer_dims, shape), axis=0)
   for (single_min, single_max) in zip(minval.flat, sampling_maxval.flat):
@@ -208,7 +210,7 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
       spec shape before sampling.
 
   Returns:
-    An Tensor sample of the requested spec.
+    A Tensor sample of the requested spec.
   """
   minval = spec.minimum
   maxval = spec.maximum
@@ -225,13 +227,13 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
   if dtype in [tf.float64, tf.float32]:
     # Avoid under/over-flow as random_uniform can't sample over the full range
     # for these types.
-    minval = np.maximum(dtype.min / 2, minval)
-    maxval = np.minimum(dtype.max / 2, maxval)
+    minval = np.maximum(dtype.min / 8, minval)
+    maxval = np.minimum(dtype.max / 8, maxval)
 
   if outer_dims is None:
     outer_dims = tf.constant([], dtype=tf.int32)
   else:
-    outer_dims = ops.convert_to_tensor(outer_dims, dtype=tf.int32)
+    outer_dims = tf.convert_to_tensor(outer_dims, dtype=tf.int32)
 
   def _unique_vals(vals):
     if vals.size > 0:
@@ -259,7 +261,7 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
     if sampling_dtype.is_integer and maxval < sampling_dtype.max:
       maxval = maxval + 1
 
-    shape = ops.convert_to_tensor(spec.shape, dtype=tf.int32)
+    shape = tf.convert_to_tensor(spec.shape, dtype=tf.int32)
     full_shape = tf.concat((outer_dims, shape), axis=0)
     res = tf.random.uniform(
         full_shape,
@@ -278,8 +280,7 @@ def sample_spec_nest(structure, seed=None, outer_dims=()):
   """Samples the given nest of specs.
 
   Args:
-    structure: An `TensorSpec`, or a nested dict, list or tuple of
-      `TensorSpec`s.
+    structure: A nest of `TensorSpec`.
     seed: A seed used for sampling ops
     outer_dims: An optional `Tensor` specifying outer dimensions to add to the
       spec shape before sampling.
@@ -310,8 +311,8 @@ def sample_spec_nest(structure, seed=None, outer_dims=()):
     if isinstance(spec, tf.SparseTensorSpec):
       outer_shape = tf.get_static_value(outer_dims)
       if outer_dims is not None and outer_shape is None:
-        raise NotImplementedError("outer_dims must be statically known, got: {}"
-                                  .format(outer_dims))
+        raise NotImplementedError(
+            "outer_dims must be statically known, got: {}".format(outer_dims))
       shape = tf.TensorShape(outer_shape or []).concatenate(spec.shape)
 
       if shape.num_elements() == 0 or tf.compat.dimension_value(shape[0]) == 0:
@@ -327,8 +328,10 @@ def sample_spec_nest(structure, seed=None, outer_dims=()):
           maximum=[x - 1 for x in shape.as_list()])
       values_dtype = tf.int32 if spec.dtype == tf.string else spec.dtype
       values_spec = BoundedTensorSpec(
-          dtype=values_dtype, shape=[7],
-          minimum=0, maximum=shape.as_list()[-1] - 1)
+          dtype=values_dtype,
+          shape=[7],
+          minimum=0,
+          maximum=shape.as_list()[-1] - 1)
       values_sample = sample_bounded_spec(values_spec, seed=seed_stream())
       if spec.dtype == tf.string:
         values_sample = tf.as_string(values_sample)
@@ -338,13 +341,57 @@ def sample_spec_nest(structure, seed=None, outer_dims=()):
               values=values_sample,
               dense_shape=shape))
     elif isinstance(spec, (TensorSpec, BoundedTensorSpec)):
-      spec = BoundedTensorSpec.from_spec(spec)
-      return sample_bounded_spec(
-          spec, outer_dims=outer_dims, seed=seed_stream())
+      if spec.dtype == tf.string:
+        sample_spec = BoundedTensorSpec(
+            spec.shape, tf.int32, minimum=0, maximum=10)
+        return tf.as_string(
+            sample_bounded_spec(
+                sample_spec, outer_dims=outer_dims, seed=seed_stream()))
+      else:
+        return sample_bounded_spec(
+            BoundedTensorSpec.from_spec(spec),
+            outer_dims=outer_dims,
+            seed=seed_stream())
     else:
       raise TypeError("Spec type not supported: '{}'".format(spec))
 
   return tf.nest.map_structure(sample_fn, structure)
+
+
+def zero_spec_nest(specs, outer_dims=None):
+  """Create zero tensors for a given spec.
+
+  Args:
+    specs: A nest of `TensorSpec`.
+    outer_dims: An optional list of constants or `Tensor` specifying outer
+      dimensions to add to the spec shape before sampling.
+
+  Returns:
+    A nest of zero tensors matching `specs`, with the optional outer
+    dimensions added.
+
+  Raises:
+    TypeError: If `specs` is an unknown type.
+    NotImplementedError: If `specs` contains non-dense tensor specs.
+  """
+
+  def make_zero(spec):
+    if not isinstance(spec, TensorSpec):
+      raise NotImplementedError("Spec type not supported: '{}'".format(spec))
+    if outer_dims is None:
+      shape = spec.shape
+    else:
+      spec_shape = tf.convert_to_tensor(value=spec.shape, dtype=tf.int32)
+      shape = tf.concat((outer_dims, spec_shape), axis=0)
+    return tf.zeros(shape, spec.dtype)
+
+  if specs:
+    if outer_dims is None:
+      outer_dims = tf.constant([], dtype=tf.int32)
+    else:
+      outer_dims = tf.convert_to_tensor(outer_dims, dtype=tf.int32)
+
+  return tf.nest.map_structure(make_zero, specs)
 
 
 def add_outer_dims_nest(specs, outer_dims):
@@ -355,8 +402,10 @@ def add_outer_dims_nest(specs, outer_dims):
       shape of tensors.
     outer_dims: a list or tuple, representing the outer shape to be added to the
       TensorSpecs in specs.
+
   Returns:
     Nested TensorSpecs with outer dimensions added to the shape of input specs.
+
   Raises:
     ValueError: if any outer_dims is neither a list nor tuple.
   """
@@ -372,3 +421,86 @@ def add_outer_dims_nest(specs, outer_dims):
     return TensorSpec(shape, spec.dtype, name=name)
 
   return tf.nest.map_structure(add_outer_dims, specs)
+
+
+def remove_outer_dims_nest(specs, outer_dims):
+  """Removes the specified number of outer dimensions from the input spec nest.
+
+  Args:
+    specs: Nested list/tuple/dict of TensorSpecs/ArraySpecs, describing the
+      shape of tensors.
+    outer_dims: (int) Number of outer dimensions to remove.
+
+  Returns:
+    Nested TensorSpecs with outer dimensions removed from the input specs.
+
+  Raises:
+    Value error if a spec in the nest has shape rank less than `outer_dims`.
+  """
+
+  def remove_outer_dims(spec):
+    """Removes the outer_dims of a tensor spec."""
+    name = spec.name
+    if len(spec.shape) < outer_dims:
+      raise ValueError("The shape of spec {} has rank lower than the specified "
+                       "outer_dims {}".format(spec, outer_dims))
+    shape = list(spec.shape)[outer_dims:]
+    if hasattr(spec, "minimum") and hasattr(spec, "maximum"):
+      if isinstance(spec.minimum,
+                    (tuple, list)) and len(spec.minimum) == len(spec.shape):
+        minimum = spec.minimum[outer_dims:]
+      else:
+        minimum = spec.minimum
+      if isinstance(spec.maximum,
+                    (tuple, list)) and len(spec.maximum) == len(spec.shape):
+        maximum = spec.maximum[outer_dims:]
+      else:
+        maximum = spec.maximum
+
+      return BoundedTensorSpec(shape, spec.dtype, minimum, maximum, name)
+    return TensorSpec(shape, spec.dtype, name=name)
+
+  return tf.nest.map_structure(remove_outer_dims, specs)
+
+
+def to_proto(spec):
+  """Encodes a nested spec into a struct_pb2.StructuredValue proto.
+
+  Args:
+    spec: Nested list/tuple or dict of TensorSpecs, describing the
+      shape of the non-batched Tensors.
+  Returns:
+    A `struct_pb2.StructuredValue` proto.
+  """
+  # Make sure spec is a tensor_spec.
+  spec = from_spec(spec)
+  signature_encoder = nested_structure_coder.StructureCoder()
+  return signature_encoder.encode_structure(spec)
+
+
+def from_proto(spec_proto):
+  """Decodes a struct_pb2.StructuredValue proto into a nested spec."""
+  signature_encoder = nested_structure_coder.StructureCoder()
+  return signature_encoder.decode_proto(spec_proto)
+
+
+def from_packed_proto(spec_packed_proto):
+  """Decodes a packed Any proto containing the structured value for the spec."""
+  spec_proto = struct_pb2.StructuredValue()
+  spec_packed_proto.Unpack(spec_proto)
+  return from_proto(spec_proto)
+
+
+def to_pbtxt_file(output_path, spec):
+  """Saves a spec encoded as a struct_pb2.StructuredValue in a pbtxt file."""
+  spec_proto = to_proto(spec)
+  with tf.io.gfile.GFile(output_path, "wb") as f:
+    f.write(text_format.MessageToString(spec_proto))
+
+
+def from_pbtxt_file(spec_path):
+  """Loads a spec encoded as a struct_pb2.StructuredValue from a pbtxt file."""
+  spec_proto = struct_pb2.StructuredValue()
+  with tf.io.gfile.GFile(spec_path, "rb") as f:
+    text_format.MergeLines(f, spec_proto)
+  return from_proto(spec_proto)

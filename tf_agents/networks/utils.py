@@ -16,10 +16,28 @@
 """Network utilities."""
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
-import tensorflow as tf
+import typing
+
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+from tf_agents.typing import types
 from tf_agents.utils import composite
+
+
+def check_single_floating_network_output(
+    output_spec: types.NestedSpec,
+    expected_output_shape: typing.Tuple[int, ...],
+    label: typing.Text):
+  expected_output_shape = tuple(int(x) for x in expected_output_shape)
+  if not (isinstance(output_spec, tf.TensorSpec)
+          and output_spec.shape == expected_output_shape
+          and output_spec.dtype.is_floating):
+    raise ValueError(
+        'Expected {} to emit a floating point tensor with inner dims '
+        '{}; but saw network output spec: {}'
+        .format(label, expected_output_shape, output_spec))
 
 
 def maybe_permanent_dropout(rate, noise_shape=None, seed=None, permanent=False):
@@ -108,6 +126,7 @@ def mlp_layers(conv_layer_params=None,
                dropout_layer_params=None,
                activation_fn=tf.keras.activations.relu,
                kernel_initializer=None,
+               weight_decay_params=None,
                name=None):
   """Generates conv and fc layers to encode into a hidden state.
 
@@ -129,6 +148,8 @@ def mlp_layers(conv_layer_params=None,
     kernel_initializer: Initializer to use for the kernels of the conv and
       dense layers. If none is provided a default variance_scaling_initializer
       is used.
+    weight_decay_params: Optional list of weight decay params for the fully
+      connected layer.
     name: Name for the mlp layers.
 
   Returns:
@@ -165,11 +186,25 @@ def mlp_layers(conv_layer_params=None,
         raise ValueError('Dropout and full connected layer parameter lists have'
                          ' different lengths (%d vs. %d.)' %
                          (len(dropout_layer_params), len(fc_layer_params)))
-    for num_units, dropout_params in zip(fc_layer_params, dropout_layer_params):
+
+    if weight_decay_params is None:
+      weight_decay_params = [None] * len(fc_layer_params)
+    else:
+      if len(weight_decay_params) != len(fc_layer_params):
+        raise ValueError('Weight decay and fully connected layer parameter '
+                         'lists have different lengths (%d vs. %d.)' %
+                         (len(weight_decay_params), len(fc_layer_params)))
+
+    for num_units, dropout_params, weight_decay in zip(
+        fc_layer_params, dropout_layer_params, weight_decay_params):
+      kernel_regularizer = None
+      if weight_decay is not None:
+        kernel_regularizer = tf.keras.regularizers.l2(weight_decay)
       layers.append(tf.keras.layers.Dense(
           num_units,
           activation=activation_fn,
           kernel_initializer=kernel_initializer,
+          kernel_regularizer=kernel_regularizer,
           name='/'.join([name, 'dense']) if name else None))
       if not isinstance(dropout_params, dict):
         dropout_params = {'rate': dropout_params} if dropout_params else None

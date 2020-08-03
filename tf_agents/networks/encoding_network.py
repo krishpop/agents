@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python2, python3
 """Keras Encoding Network.
 
 Implements a network that will generate the following layers:
@@ -30,7 +31,8 @@ from __future__ import print_function
 
 from absl import logging
 import gin
-import tensorflow as tf
+from six.moves import zip
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.networks import network
 from tf_agents.networks import utils
@@ -65,7 +67,7 @@ def _copy_layer(layer):
     raise ValueError('DenseFeatures V1 is not supported. '
                      'Use tf.compat.v2.keras.layers.DenseFeatures instead.')
   if layer.built:
-    logging.warn(
+    logging.warning(
         'Beware: Copying a layer that has already been built: \'%s\'.  '
         'This can lead to subtle bugs because the original layer\'s weights '
         'will not be used in the copy.', layer.name)
@@ -86,6 +88,7 @@ class EncodingNetwork(network.Network):
                fc_layer_params=None,
                dropout_layer_params=None,
                activation_fn=tf.keras.activations.relu,
+               weight_decay_params=None,
                kernel_initializer=None,
                batch_squash=True,
                dtype=tf.float32,
@@ -163,7 +166,9 @@ class EncodingNetwork(network.Network):
         the fully connected layers; there is a dropout layer after each fully
         connected layer, except if the entry in the list is None. This list must
         have the same length of fc_layer_params, or be None.
-      activation_fn: Activation function, e.g. tf.keras.activations.relu,.
+      activation_fn: Activation function, e.g. tf.keras.activations.relu.
+      weight_decay_params: Optional list of weight decay parameters for the
+        fully connected layers.
       kernel_initializer: Initializer to use for the kernels of the conv and
         dense layers. If none is provided a default variance_scaling_initializer
       batch_squash: If True the outer_ranks of the observation are squashed into
@@ -195,8 +200,7 @@ class EncodingNetwork(network.Network):
       # to work.
       if not nest.is_sequence(input_tensor_spec):
         input_nest = [input_tensor_spec]
-      nest.assert_shallow_structure(
-          preprocessing_layers, input_nest, check_types=False)
+      nest.assert_shallow_structure(preprocessing_layers, input_nest)
 
     if (len(tf.nest.flatten(input_tensor_spec)) > 1 and
         preprocessing_combiner is None):
@@ -239,8 +243,7 @@ class EncodingNetwork(network.Network):
                 dilation_rate=dilation_rate,
                 activation=activation_fn,
                 kernel_initializer=kernel_initializer,
-                dtype=dtype,
-                name='%s/conv%s' % (name, conv_type)))
+                dtype=dtype))
 
     layers.append(tf.keras.layers.Flatten())
 
@@ -252,15 +255,26 @@ class EncodingNetwork(network.Network):
           raise ValueError('Dropout and fully connected layer parameter lists'
                            'have different lengths (%d vs. %d.)' %
                            (len(dropout_layer_params), len(fc_layer_params)))
-      for num_units, dropout_params in zip(fc_layer_params,
-                                           dropout_layer_params):
+      if weight_decay_params is None:
+        weight_decay_params = [None] * len(fc_layer_params)
+      else:
+        if len(weight_decay_params) != len(fc_layer_params):
+          raise ValueError('Weight decay and fully connected layer parameter '
+                           'lists have different lengths (%d vs. %d.)' %
+                           (len(weight_decay_params), len(fc_layer_params)))
+
+      for num_units, dropout_params, weight_decay in zip(
+          fc_layer_params, dropout_layer_params, weight_decay_params):
+        kernal_regularizer = None
+        if weight_decay is not None:
+          kernal_regularizer = tf.keras.regularizers.l2(weight_decay)
         layers.append(
             tf.keras.layers.Dense(
                 num_units,
                 activation=activation_fn,
                 kernel_initializer=kernel_initializer,
-                dtype=dtype,
-                name='%s/dense' % name))
+                kernel_regularizer=kernal_regularizer,
+                dtype=dtype))
         if not isinstance(dropout_params, dict):
           dropout_params = {'rate': dropout_params} if dropout_params else None
 
@@ -294,8 +308,7 @@ class EncodingNetwork(network.Network):
     else:
       processed = []
       for obs, layer in zip(
-          nest.flatten_up_to(
-              self._preprocessing_nest, observation, check_types=False),
+          nest.flatten_up_to(self._preprocessing_nest, observation),
           self._flat_preprocessing_layers):
         processed.append(layer(obs, training=training))
       if len(processed) == 1 and self._preprocessing_combiner is None:

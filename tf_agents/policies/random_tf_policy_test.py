@@ -19,11 +19,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
+import math
 
 from absl.testing import parameterized
 import numpy as np
 import tensorflow as tf
+from tf_agents.bandits.policies import policy_utilities
+from tf_agents.bandits.specs import utils as bandit_spec_utils
 from tf_agents.policies import random_tf_policy
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import time_step as ts
@@ -40,16 +42,33 @@ from tf_agents.utils import test_utils
 class RandomTFPolicyTest(test_utils.TestCase, parameterized.TestCase):
 
   def create_batch(self, single_time_step, batch_size):
-    batch_time_step = nest_utils.stack_nested_tensors(
-        [single_time_step] * batch_size)
+    batch_time_step = nest_utils.stack_nested_tensors([single_time_step] *
+                                                      batch_size)
     return batch_time_step
 
-  def create_time_step(self):
+  def create_time_step(self, use_per_arm_features=False, num_arms=1):
     observation = tf.constant([[1, 2], [3, 4]], dtype=tf.float32)
-    time_step = ts.restart(observation)
+    observation_spec = tensor_spec.TensorSpec(observation.shape.as_list(),
+                                              tf.float32)
+    if use_per_arm_features:
+      # Create arm features with:
+      # max_num_arms = 4, num_action = 2, per_arm_dim = 2.
+      observation = {
+          bandit_spec_utils.GLOBAL_FEATURE_KEY: observation,
+          bandit_spec_utils.PER_ARM_FEATURE_KEY:
+              tf.constant([[5, 6],
+                           [7, 8],
+                           [9, 10],
+                           [11, 12]],
+                          tf.float32),
+          bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY:
+              tf.constant(num_arms, tf.int32),
+      }
+      observation_spec = tf.nest.map_structure(
+          lambda t: tensor_spec.TensorSpec(t.shape.as_list(), t.dtype),
+          observation)
 
-    observation_spec = tensor_spec.TensorSpec(
-        observation.shape.as_list(), tf.float32)
+    time_step = ts.restart(observation)
     time_step_spec = ts.time_step_spec(observation_spec)
 
     return time_step_spec, time_step
@@ -119,6 +138,9 @@ class RandomTFPolicyTest(test_utils.TestCase, parameterized.TestCase):
         tensor_spec.BoundedTensorSpec((1, 2), dtype, -10, 10)
     ]
     time_step_spec, time_step = self.create_time_step()
+    batch_size = 3
+    time_step = self.create_batch(time_step, batch_size)
+
     policy = random_tf_policy.RandomTFPolicy(
         time_step_spec=time_step_spec,
         action_spec=action_spec,
@@ -130,10 +152,13 @@ class RandomTFPolicyTest(test_utils.TestCase, parameterized.TestCase):
     step = self.evaluate(action_step)
     action_ = step.action
     # For integer specs, boundaries are inclusive.
-    p = 1./21 if dtype.is_integer else 1./20
+    p = 1. / 21 if dtype.is_integer else 1. / 20
     np.testing.assert_allclose(
         np.array(step.info.log_probability, dtype=np.float32),
-        np.array(np.log([p, p], dtype=np.float32)),
+        np.array(
+            np.log([[math.pow(p, 6) for _ in range(3)],
+                    [math.pow(p, 2) for _ in range(3)]]),
+            dtype=np.float32),
         rtol=1e-5)
     self.assertTrue(np.all(action_[0] >= -10))
     self.assertTrue(np.all(action_[0] <= 10))
@@ -185,27 +210,90 @@ class RandomTFPolicyTest(test_utils.TestCase, parameterized.TestCase):
     self.assertAllClose(step.info.log_probability,
                         tf.constant(np.log(1. / 3), shape=[batch_size]))
 
-  def testInfoSpec(self, dtype):
-    PolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
-        'PolicyInfo',
-        ('log_probability', 'predicted_rewards'))
-    # Set default empty tuple for all fields.
-    PolicyInfo.__new__.__defaults__ = ((),) * len(PolicyInfo._fields)
+  def testNumActions(self, dtype):
+    if not dtype.is_integer:
+      self.skipTest('testNumActions only applies to integer dtypes')
 
+    batch_size = 1000
+
+    # Create action spec, time_step and spec with max_num_arms = 4.
+    action_spec = tensor_spec.BoundedTensorSpec((), dtype, 0, 3)
+    time_step_spec, time_step_1 = self.create_time_step(
+        use_per_arm_features=True, num_arms=2)
+    _, time_step_2 = self.create_time_step(
+        use_per_arm_features=True, num_arms=3)
+    # First half of time_step batch will have num_action = 2 and second
+    # half will have num_actions = 3.
+    half_batch_size = int(batch_size / 2)
+    time_step = nest_utils.stack_nested_tensors(
+        [time_step_1] * half_batch_size + [time_step_2] * half_batch_size)
+
+    # The features for the chosen arm is saved to policy_info.
+    chosen_arm_features_info = (
+        policy_utilities.create_chosen_arm_features_info_spec(
+            time_step_spec.observation))
+    info_spec = policy_utilities.PerArmPolicyInfo(
+        chosen_arm_features=chosen_arm_features_info)
+
+    policy = random_tf_policy.RandomTFPolicy(
+        time_step_spec=time_step_spec,
+        action_spec=action_spec,
+        info_spec=info_spec,
+        accepts_per_arm_features=True,
+        emit_log_probability=True)
+
+    action_step = policy.action(time_step)
+    tf.nest.assert_same_structure(action_spec, action_step.action)
+
+    # Sample from the policy 1000 times, and ensure that actions considered
+    # invalid according to the mask are never chosen.
+    step = self.evaluate(action_step)
+    action_ = step.action
+    self.assertTrue(np.all(action_ >= 0))
+    self.assertTrue(np.all(action_[:half_batch_size] < 2))
+    self.assertTrue(np.all(action_[half_batch_size:] < 3))
+
+    # With num_action valid actions, probabilities should be 1/num_actions.
+    self.assertAllClose(step.info.log_probability[:half_batch_size],
+                        tf.constant(np.log(1. / 2), shape=[half_batch_size]))
+    self.assertAllClose(step.info.log_probability[half_batch_size:],
+                        tf.constant(np.log(1. / 3), shape=[half_batch_size]))
+
+  def testInfoSpec(self, dtype):
     action_spec = [
         tensor_spec.BoundedTensorSpec((2, 3), dtype, -10, 10),
         tensor_spec.BoundedTensorSpec((1, 2), dtype, -10, 10)
     ]
+    info_spec = [
+        tensor_spec.TensorSpec([1], dtype=tf.float32, name='loc'),
+        tensor_spec.TensorSpec([1], dtype=tf.float32, name='scale')
+    ]
     time_step_spec, time_step = self.create_time_step()
-    info_spec = PolicyInfo()
     policy = random_tf_policy.RandomTFPolicy(
         time_step_spec=time_step_spec,
         action_spec=action_spec,
         info_spec=info_spec)
 
+    # Test without batch
     action_step = policy.action(time_step)
     tf.nest.assert_same_structure(action_spec, action_step.action)
+    self.assertEqual((2, 3,), action_step.action[0].shape)
+    self.assertEqual((1, 2,), action_step.action[1].shape)
     tf.nest.assert_same_structure(info_spec, action_step.info)
+    self.assertEqual((1,), action_step.info[0].shape)
+    self.assertEqual((1,), action_step.info[1].shape)
+
+    # Test with batch, we should see the additional outer batch dim for both
+    # `action` and `info`.
+    batch_size = 2
+    batched_time_step = self.create_batch(time_step, batch_size)
+    batched_action_step = policy.action(batched_time_step)
+    tf.nest.assert_same_structure(action_spec, batched_action_step.action)
+    self.assertEqual((batch_size, 2, 3,), batched_action_step.action[0].shape)
+    self.assertEqual((batch_size, 1, 2,), batched_action_step.action[1].shape)
+    tf.nest.assert_same_structure(info_spec, batched_action_step.info)
+    self.assertEqual((batch_size, 1,), batched_action_step.info[0].shape)
+    self.assertEqual((batch_size, 1,), batched_action_step.info[1].shape)
 
 
 if __name__ == '__main__':
